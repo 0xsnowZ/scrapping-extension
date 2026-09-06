@@ -233,6 +233,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     currentLang = lang;
     document.body.dir = lang === "ar" ? "rtl" : "ltr";
+    document.body.dataset.lang = lang;
+    document.documentElement.lang = lang;
+
     document.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.getAttribute("data-i18n");
       if (i18n[lang][key]) {
@@ -258,7 +261,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       headerLangSelect.value = lang;
     }
 
-    chrome.storage.local.set({ uiLang: lang });
+    if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+      chrome.storage.local.set({ uiLang: lang });
+    }
 
     const statusClass = statusText.className;
     if (statusClass.includes("status-idle"))
