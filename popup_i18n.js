@@ -34,6 +34,7 @@ window.AutoAzubiI18n = {
     captchaLabel: "Captcha Sound",
     finishLabel: "Finish Sound",
     autoExportLabel: "Auto-Export on Finish",
+    deepEmailLookupLabel: "Deep Email Lookup",
     noteTitle: "Note:",
     noteDesc:
       "Please resolve any Captcha challenges manually to resume data extraction.",
@@ -124,6 +125,7 @@ window.AutoAzubiI18n = {
     captchaLabel: "Captcha-Ton",
     finishLabel: "Abschluss-Ton",
     autoExportLabel: "Autom. Export bei Abschluss",
+    deepEmailLookupLabel: "Tiefen-E-Mail-Suche (Impressum)",
     noteTitle: "Hinweis:",
     noteDesc:
       "Bitte lösen Sie eventuelle Captchas manuell, um die Extraktion fortzusetzen.",
@@ -214,6 +216,7 @@ window.AutoAzubiI18n = {
     captchaLabel: "Son de Captcha",
     finishLabel: "Son de fin",
     autoExportLabel: "Export auto à la fin",
+    deepEmailLookupLabel: "Recherche e-mail approfondie",
     noteTitle: "Remarque :",
     noteDesc:
       "Veuillez résoudre les défis Captcha manuellement pour reprendre l'extraction.",
@@ -304,6 +307,7 @@ window.AutoAzubiI18n = {
     captchaLabel: "صوت الكابتشا",
     finishLabel: "صوت الانتهاء",
     autoExportLabel: "تصدير تلقائي عند الانتهاء",
+    deepEmailLookupLabel: "البحث المعمق عن البريد (Impressum)",
     noteTitle: "ملاحظة:",
     noteDesc: "يرجى حل أي تحديات كابتشا يدويًا لاستئناف استخراج البيانات.",
     downloadBtn: "تصدير البيانات",

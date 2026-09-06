@@ -11,12 +11,8 @@ let currentPageUrl = null;
 let processedHits = 0;        // tracks total hits checked across all pages
 let currentHitStartIndex = 0; // tracks hit index within the current page for pause/resume
 
-// Domain crawl cache: skip websites we already checked for email
-const crawledDomains = new Map(); // domain -> email or ''
-
-// Helper function to wait
-// sleep, sleepWithThrottle, waitForElement, extractEmailFromHtml, extractPhoneFromHtml
-// are provided by utils.js (loaded first via manifest.json)
+// Domain crawl cache, crawler, sleep, sleepWithThrottle, waitForElement,
+// extractEmailFromHtml, extractPhoneFromHtml are provided by utils.js (loaded first via manifest.json)
 
 const finishedSound = new Audio(chrome.runtime.getURL('finished.mp3'));
 
@@ -24,14 +20,15 @@ const finishedSound = new Audio(chrome.runtime.getURL('finished.mp3'));
 let settings = {
     notifyCaptcha: false,
     notifyFinish: true,
-    autoExport: false
+    autoExport: false,
+    deepEmailLookup: true
 };
 
 // ─── Session Persistence ─────────────────────────────────────────────────────────
 
 function saveGmapsSession() {
     // Save session metadata and data atomically to prevent partial-write race conditions
-    chrome.storage.local.set({
+    StorageHelper.setMultiple({
         scrapedData,
         [GMAPS_SESSION_KEY]: {
             currentPageUrl,
@@ -45,15 +42,16 @@ function saveGmapsSession() {
 }
 
 function clearGmapsSession() {
-    chrome.storage.local.remove(GMAPS_SESSION_KEY);
+    StorageHelper.remove(GMAPS_SESSION_KEY);
 }
 
 // Initialize State from Storage — auto-resume if a session was active
-chrome.storage.local.get(['scrapedData', GMAPS_SESSION_KEY, 'notifyCaptcha', 'notifyFinish', 'autoExport'], (result) => {
+StorageHelper.get(['scrapedData', GMAPS_SESSION_KEY, 'notifyCaptcha', 'notifyFinish', 'autoExport', 'deepEmailLookup']).then((result) => {
     if (result.scrapedData) scrapedData = result.scrapedData;
     settings.notifyCaptcha = result.notifyCaptcha === true;
     settings.notifyFinish = result.notifyFinish !== false;
     settings.autoExport = result.autoExport === true;
+    settings.deepEmailLookup = true;
 
     const session = result[GMAPS_SESSION_KEY];
     if (session) {
@@ -105,8 +103,7 @@ async function getDasOertlicheTotal() {
     try {
         let response = await chrome.runtime.sendMessage({ action: 'fetch_text', url: searchUrl });
         if (response && response.success) {
-            let parser = new DOMParser();
-            let doc = parser.parseFromString(response.text, 'text/html');
+            let doc = parseHtml(response.text);
 
             // Handle Ortsauswahl (City Selection)
             const ortsLink = doc.querySelector('a[href*="zvo_ok=1"]');
@@ -117,7 +114,7 @@ async function getDasOertlicheTotal() {
                 }
                 response = await chrome.runtime.sendMessage({ action: 'fetch_text', url: redirectUrl });
                 if (response && response.success) {
-                    doc = parser.parseFromString(response.text, 'text/html');
+                    doc = parseHtml(response.text);
                 }
             }
 
@@ -146,8 +143,7 @@ async function getDasOertlicheTotal() {
 function extractWebsiteUrl(rawHtml) {
     if (!rawHtml) return '';
 
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(rawHtml, 'text/html');
+    const doc = parseHtml(rawHtml);
 
     // Strategy 1: Look for .hitlnk_www or .www links (DasÖrtliche website links)
     const wwwLink = doc.querySelector('.hitlnk_www, .hitlnk_homepage, a.hitlnk_www_detail');
@@ -181,102 +177,7 @@ function extractWebsiteUrl(rawHtml) {
     return '';
 }
 
-/**
- * Crawl a company's website to find email from Impressum/Kontakt pages
- * German law requires Impressum with contact email
- */
-async function crawlWebsiteForEmail(websiteUrl) {
-    if (!websiteUrl) return '';
-
-    try {
-        // Normalize URL
-        let baseUrl = websiteUrl.replace(/\/+$/, '');
-
-        // Step 1: Always check the homepage first (email often in footer)
-        const homeResp = await chrome.runtime.sendMessage({ action: 'fetch_text_utf8', url: baseUrl + '/' });
-        let contactPaths = ['/impressum', '/kontakt', '/imprint'];
-
-        if (homeResp && homeResp.success && homeResp.text) {
-            const homeEmail = extractEmailFromHtml(homeResp.text);
-            if (homeEmail) {
-                console.log(`Found email on homepage: ${homeEmail}`);
-                return homeEmail;
-            }
-
-            // Step 2: If no email, dynamically find the exact Impressum/Kontakt link from the homepage HTML
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(homeResp.text, 'text/html');
-            const links = Array.from(doc.querySelectorAll('a'));
-            
-            const dynamicContactLink = links.find(a => {
-                const text = a.textContent.toLowerCase();
-                const href = a.getAttribute('href') || '';
-                return text.includes('impressum') || text.includes('kontakt') || href.includes('impressum') || href.includes('kontakt');
-            });
-
-            if (dynamicContactLink) {
-                let dynamicHref = dynamicContactLink.getAttribute('href');
-                if (dynamicHref && !dynamicHref.startsWith('http') && !dynamicHref.startsWith('#') && !dynamicHref.startsWith('mailto:')) {
-                    dynamicHref = dynamicHref.startsWith('/') ? dynamicHref : '/' + dynamicHref;
-                    // Prioritize the dynamically found path
-                    contactPaths.unshift(dynamicHref);
-                } else if (dynamicHref && dynamicHref.startsWith('http')) {
-                    // It's an absolute URL (e.g. on a subdomain)
-                    contactPaths.unshift(dynamicHref);
-                }
-            }
-        }
-
-        // De-duplicate contact paths to prevent unnecessary fetches
-        contactPaths = [...new Set(contactPaths)];
-
-        // Step 3: Try the paths
-        for (const path of contactPaths) {
-            if (!isScraping) break;
-
-            // Handle absolute URLs dynamically found vs relative paths
-            const contactUrl = path.startsWith('http') ? path : baseUrl + path;
-            console.log(`Trying contact page: ${contactUrl}`);
-
-            const resp = await chrome.runtime.sendMessage({ action: 'fetch_text_utf8', url: contactUrl });
-            if (resp && resp.success && resp.text) {
-                const email = extractEmailFromHtml(resp.text);
-                if (email) {
-                    console.log(`Found email on ${contactUrl}: ${email}`);
-                    return email;
-                }
-            }
-        }
-
-    } catch (e) {
-        console.error('Error crawling website for email:', e);
-    }
-
-    return '';
-}
-
-/**
- * Timeout-guarded wrapper around crawlWebsiteForEmail.
- * Prevents slow/unresponsive websites from blocking the entire scrape.
- * Returns '' if the crawl exceeds the time limit.
- */
-async function crawlWebsiteForEmailWithTimeout(websiteUrl, timeoutMs = 6000) {
-    // Check domain cache first — avoid re-crawling the same site
-    try {
-        const domain = new URL(websiteUrl).hostname;
-        if (crawledDomains.has(domain)) {
-            return crawledDomains.get(domain);
-        }
-        const email = await Promise.race([
-            crawlWebsiteForEmail(websiteUrl),
-            new Promise(resolve => setTimeout(() => resolve(''), timeoutMs))
-        ]);
-        crawledDomains.set(domain, email);
-        return email;
-    } catch (e) {
-        return '';
-    }
-}
+// crawlWebsiteForEmail and crawlWebsiteForEmailWithTimeout are provided by utils.js
 
 async function startScraping() {
     try {
@@ -286,7 +187,7 @@ async function startScraping() {
         isScraping = false;
         isPaused = false;
         clearGmapsSession();
-        chrome.runtime.sendMessage({ action: 'error', message: String(err) });
+        safeSendMessage({ action: 'error', message: String(err) });
     }
 }
 
@@ -296,14 +197,14 @@ async function _startScraping() {
     // Prioritize the exact keywords typed by the user in the extension popup.
     // Google Maps aggressively translates "IT in Berlin" to "Information Technology in Berlin",
     // which breaks DasÖrtliche's search engine.
-    const stored = await chrome.storage.local.get(['lastGmapsKw', 'lastGmapsCity']);
+    const stored = await StorageHelper.get(['lastGmapsKw', 'lastGmapsCity']);
     if (stored.lastGmapsKw && stored.lastGmapsCity) {
         keyword = stored.lastGmapsKw;
         city = stored.lastGmapsCity;
     }
 
     if (!keyword || !city) {
-        chrome.runtime.sendMessage({ action: 'error', message: 'Could not detect keyword and city. Please search using the popup\'s Google Maps tab.' });
+        safeSendMessage({ action: 'error', message: 'Could not detect keyword and city. Please search using the popup\'s Google Maps tab.' });
         isScraping = false;
         return;
     }
@@ -331,8 +232,7 @@ async function _startScraping() {
             break;
         }
 
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(response.text, 'text/html');
+        const doc = parseHtml(response.text);
 
         const ortsLink = doc.querySelector('a[href*="zvo_ok=1"]');
         if (ortsLink && !doc.querySelector('.hit')) {
@@ -399,13 +299,13 @@ async function _startScraping() {
     portalCount = scrapedData.filter(d => d.source === PORTAL_SOURCE).length;
     if (isScraping && !isPaused && (portalCount >= targetLimit || !currentPageUrl)) {
         console.log("Scraping finished.");
-        if (settings.notifyFinish) finishedSound.play().catch(e => console.error("Audio play error", e));
+        if (settings.notifyFinish) playAudioSafely(finishedSound);
         isScraping = false;
         isPaused = false;
         clearGmapsSession();
-        chrome.storage.local.set({ scrapedData });
+        StorageHelper.set('scrapedData', scrapedData);
         const autoExported = triggerAutoExport(scrapedData, settings);
-        chrome.runtime.sendMessage({ action: 'finished', count: scrapedData.length, portalCount, totalChecked: processedHits || portalCount, autoExported });
+        safeSendMessage({ action: 'finished', count: scrapedData.length, portalCount, totalChecked: processedHits || portalCount, autoExported });
     }
 }
 
@@ -438,11 +338,12 @@ async function processHit(hit) {
 
             processedHits++;
             const pc = scrapedData.filter(d => d.source === PORTAL_SOURCE).length;
-            chrome.runtime.sendMessage({ action: 'progress', count: scrapedData.length, portalCount: pc, currentTitle: `Checked ${processedHits} hits... Scanning ${company}` });
+            safeSendMessage({ action: 'progress', count: scrapedData.length, portalCount: pc, currentTitle: `Checked ${processedHits} hits... Scanning ${company}` });
             await sleep(Math.random() * 80 + 20); // Short delay, not rate limiting
 
             // Quick check: try to extract email directly from the list-page hit HTML
             let email = extractEmailFromHtml(hit.innerHTML);
+            let websiteUrl = '';
 
             // If no email on list page, fetch the detail page
             if (!email) {
@@ -450,26 +351,24 @@ async function processHit(hit) {
                 if (detailResp && detailResp.success) {
                     const rawHtml = detailResp.text;
                     email = extractEmailFromHtml(rawHtml);
+                    websiteUrl = extractWebsiteUrl(rawHtml);
                     
-                    if (!email) {
-                        const websiteUrl = extractWebsiteUrl(rawHtml);
-                        if (websiteUrl) {
-                            email = await crawlWebsiteForEmailWithTimeout(websiteUrl);
-                        }
+                    if (!email && settings.deepEmailLookup && websiteUrl) {
+                        email = await crawlWebsiteForEmailWithTimeout(websiteUrl);
                     }
                 }
             }
 
             if (email) {
                 // Strict Data Deduplication: Check if email already exists in our dataset
-                const isDuplicate = scrapedData.some(item => item.email.toLowerCase() === email.toLowerCase());
+                const isDuplicate = isDuplicateEmail(scrapedData, email);
                 
                 // Atomic guard: synchronous check + push with no await in between
                 const currentPortalCount = scrapedData.filter(d => d.source === PORTAL_SOURCE).length;
                 if (!isDuplicate && currentPortalCount < targetLimit) {
-                    scrapedData.push({ company, address, phone, email, source: PORTAL_SOURCE, extractedAt: new Date().toISOString() });
+                    scrapedData.push({ company, address, phone, email, link: detailUrl, website: websiteUrl || '', source: PORTAL_SOURCE, extractedAt: new Date().toISOString() });
                     const newPc = currentPortalCount + 1;
-                    chrome.runtime.sendMessage({ action: 'progress', count: scrapedData.length, portalCount: newPc, currentTitle: `Found email for: ${company}` });
+                    safeSendMessage({ action: 'progress', count: scrapedData.length, portalCount: newPc, currentTitle: `Found email for: ${company}` });
                 }
             }
         }
@@ -487,8 +386,8 @@ chrome.runtime.onMessage.addListener(
         () => ({ isScraping, isPaused }),
         {
             onSettings: (s) => {
-                settings = s;
-                chrome.storage.local.set(s);
+                settings = { ...s, deepEmailLookup: true };
+                StorageHelper.setMultiple(settings);
             },
             onUpdateLimit: (limit) => { targetLimit = limit; },
             onPause: () => { isPaused = true; },
@@ -511,7 +410,7 @@ chrome.runtime.onMessage.addListener(
                 isScraping = false;
                 isPaused = false;
                 clearGmapsSession();
-                chrome.storage.local.set({ scrapedData });
+                StorageHelper.set('scrapedData', scrapedData);
                 sendResponse({ status: 'stopped' });
             },
             reset: (request, sendResponse) => {
@@ -522,7 +421,7 @@ chrome.runtime.onMessage.addListener(
                 currentHitStartIndex = 0;
                 processedHits = 0;
                 clearGmapsSession();
-                chrome.storage.local.set({ scrapedData: [] });
+                StorageHelper.set('scrapedData', []);
                 sendResponse({ status: 'reset' });
             },
             getData: (request, sendResponse) => {

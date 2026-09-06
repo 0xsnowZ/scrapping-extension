@@ -350,6 +350,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         "notifyCaptcha",
         "notifyFinish",
         "autoExport",
+        "deepEmailLookup",
         "scrapedData",
         "isScraping",
         "isPaused",
@@ -446,6 +447,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       notifyCaptcha: notifyCaptchaCheckbox.checked,
       notifyFinish: notifyFinishCheckbox.checked,
       autoExport: autoExportCheckbox ? autoExportCheckbox.checked : false,
+      deepEmailLookup: true,
     };
   }
 
@@ -499,8 +501,8 @@ document.addEventListener("DOMContentLoaded", async () => {
             let scriptToInject = "content_script.js";
             if (
               currTab.url &&
-              currTab.url.includes("google.") &&
-              currTab.url.includes("map")
+              ((currTab.url.includes("google.") && currTab.url.includes("map")) ||
+                currTab.url.includes("dasoertliche.de"))
             ) {
               scriptToInject = "gmaps_script.js";
             } else if (currTab.url && currTab.url.includes("ausbildung.de")) {
@@ -513,7 +515,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
             await chrome.scripting.executeScript({
               target: { tabId: currTab.id },
-              files: ["utils.js", scriptToInject],
+              files: ["xlsx.mini.min.js", "popup_csv.js", "utils.js", scriptToInject],
             });
             // Wait a bit for initialization then retry once
             setTimeout(

@@ -6,10 +6,11 @@ let targetLimit = 50;
 const PORTAL_SOURCE = 'Azubi.de';
 
 const finishedSound = new Audio(chrome.runtime.getURL("finished.mp3"));
-let settings = { notifyFinish: true, autoExport: false };
-chrome.storage.local.get(["notifyFinish", "autoExport"], (res) => {
+let settings = { notifyFinish: true, autoExport: false, deepEmailLookup: true };
+StorageHelper.get(["notifyFinish", "autoExport", "deepEmailLookup"]).then((res) => {
   if (res.notifyFinish !== undefined) settings.notifyFinish = res.notifyFinish !== false;
   if (res.autoExport !== undefined) settings.autoExport = res.autoExport === true;
+  settings.deepEmailLookup = true;
 });
 
 // sleep, extractEmailFromHtml, extractPhoneFromHtml, extractCompanyFromDoc, extractAddressFromDoc
@@ -20,17 +21,15 @@ chrome.storage.local.get(["notifyFinish", "autoExport"], (res) => {
 const AZUBI_SESSION_KEY = 'azubiScrapingSession';
 
 async function saveAzubiSession(session) {
-  return new Promise(r => chrome.storage.local.set({ [AZUBI_SESSION_KEY]: session }, r));
+  return StorageHelper.set(AZUBI_SESSION_KEY, session);
 }
 
 async function loadAzubiSession() {
-  return new Promise(r =>
-    chrome.storage.local.get([AZUBI_SESSION_KEY], res => r(res[AZUBI_SESSION_KEY] || null))
-  );
+  return StorageHelper.get(AZUBI_SESSION_KEY, null);
 }
 
 async function clearAzubiSession() {
-  return new Promise(r => chrome.storage.local.remove(AZUBI_SESSION_KEY, r));
+  return StorageHelper.remove(AZUBI_SESSION_KEY);
 }
 
 // Extract all unique job detail links from a parsed document
@@ -77,21 +76,17 @@ function buildPageUrl(baseUrl, page) {
 }
 
 // Main scraping loop — fetches pages directly via URL pagination
-async function handleSearchPage(limit = 50) {
-  if (isScraping) return;
+async function handleSearchPage(limit = 50, startSession = null) {
+  if (isScraping && !startSession) return;
   isScraping = true;
   isPaused = false;
   targetLimit = limit;
 
   await sleep(1000);
 
-  let currentData = await new Promise((r) => {
-    chrome.storage.local.get(["scrapedData"], (res) =>
-      r(res.scrapedData || []),
-    );
-  });
+  let currentData = await StorageHelper.get("scrapedData", []);
 
-  const processedLinks = new Set();
+  const processedLinks = new Set(startSession?.processedLinks || []);
 
   const baseUrl = (() => {
     const url = new URL(window.location.href);
@@ -99,12 +94,12 @@ async function handleSearchPage(limit = 50) {
     return url.toString();
   })();
 
-  let page = 1;
+  let page = startSession?.page || 1;
   let emptyPageCount = 0;
   const MAX_EMPTY_PAGES = 10;
 
   // Save initial session
-  await saveAzubiSession({ limit, baseUrl, page, processedLinks: [] });
+  await saveAzubiSession({ limit, baseUrl, page, processedLinks: [...processedLinks] });
 
   while (isScraping && currentData.filter(d => d.source === PORTAL_SOURCE).length < targetLimit) {
     // Pause check
@@ -129,8 +124,7 @@ async function handleSearchPage(limit = 50) {
           break;
         }
         const html = await res.text();
-        const parser = new DOMParser();
-        pageDoc = parser.parseFromString(html, "text/html");
+        pageDoc = parseHtml(html);
       } catch (err) {
         console.error("[Azubi] Error fetching page:", err);
         break;
@@ -172,18 +166,30 @@ async function handleSearchPage(limit = 50) {
         }
 
         const html = await response.text();
+        const doc = parseHtml(html);
 
-        const email = extractEmailFromHtml(html);
+        let email = extractEmailFromHtml(html);
+        const website = await resolveCompanyWebsite(doc, "azubi.de");
+
+        // Deep Email Lookup fallback if no direct email is in the job card
+        if (!email && settings.deepEmailLookup && website) {
+          console.log(`[Azubi] No direct email for ${jobUrl}, attempting Deep Email Lookup on: ${website}`);
+          try {
+            email = await crawlWebsiteForEmailWithTimeout(website, 5000);
+            if (email) {
+              console.log(`[Azubi] ✓ Deep Lookup found email: ${email} (${website})`);
+            }
+          } catch (e) {
+            console.warn(`[Azubi] Deep Lookup error for ${website}:`, e);
+          }
+        }
+
         if (!email) {
-          console.log("[Azubi] No email, skipping:", jobUrl);
+          console.log("[Azubi] No email found, skipping:", jobUrl);
           continue; // email is required
         }
 
         const phone = extractPhoneFromHtml(html);
-
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, "text/html");
-
         let company = extractCompanyFromDoc(doc);
 
         // Azubi.de fallback: try additional selectors specific to this portal
@@ -221,8 +227,7 @@ async function handleSearchPage(limit = 50) {
         const address = extractAddressFromDoc(doc);
 
         // Email dedup: skip if this email was already scraped
-        const isDuplicate = currentData.some(d => d.email.toLowerCase() === email.toLowerCase());
-        if (isDuplicate) {
+        if (isDuplicateEmail(currentData, email)) {
           console.log("[Azubi] Duplicate email, skipping:", email);
           continue;
         }
@@ -233,16 +238,15 @@ async function handleSearchPage(limit = 50) {
           address,
           contact: "",
           link: jobUrl,
+          website: website || "",
           phone,
           source: PORTAL_SOURCE,
           extractedAt: new Date().toISOString(),
         });
 
-        await new Promise((r) =>
-          chrome.storage.local.set({ scrapedData: currentData }, r),
-        );
+        await StorageHelper.set("scrapedData", currentData);
         const portalCount = currentData.filter(d => d.source === PORTAL_SOURCE).length;
-        chrome.runtime.sendMessage({
+        safeSendMessage({
           action: "progress",
           count: currentData.length,
           portalCount,
@@ -273,10 +277,10 @@ async function handleSearchPage(limit = 50) {
   }
 
   if (isScraping) {
-    if (settings.notifyFinish) finishedSound.play().catch(() => {});
+    if (settings.notifyFinish) playAudioSafely(finishedSound);
     const portalCount = currentData.filter(d => d.source === PORTAL_SOURCE).length;
     const autoExported = triggerAutoExport(currentData, settings);
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: "finished",
       count: currentData.length,
       portalCount,
@@ -287,21 +291,21 @@ async function handleSearchPage(limit = 50) {
   isScraping = false;
   isPaused = false;
   await clearAzubiSession();
-  chrome.storage.local.set({ isScraping: false, isPaused: false });
+  StorageHelper.setMultiple({ isScraping: false, isPaused: false });
 }
 
 // Wrap with error propagation
 const _handleSearchPage = handleSearchPage;
-handleSearchPage = async function(limit) {
+handleSearchPage = async function(limit = 50, startSession = null) {
   try {
-    await _handleSearchPage(limit);
+    await _handleSearchPage(limit, startSession);
   } catch (err) {
     console.error('[Azubi] Scraping error:', err);
     isScraping = false;
     isPaused = false;
     await clearAzubiSession();
-    chrome.storage.local.set({ isScraping: false, isPaused: false });
-    chrome.runtime.sendMessage({ action: 'error', message: String(err) });
+    StorageHelper.setMultiple({ isScraping: false, isPaused: false });
+    safeSendMessage({ action: 'error', message: String(err) });
   }
 };
 
@@ -339,7 +343,7 @@ chrome.runtime.onMessage.addListener(
   createScraperMessageHandler(
     () => ({ isScraping, isPaused }),
     {
-      onSettings: (s) => { settings = s; },
+      onSettings: (s) => { settings = { ...s, deepEmailLookup: true }; },
       onUpdateLimit: (limit) => { targetLimit = limit; },
       onPause: () => { isPaused = true; },
       onResume: () => { isPaused = false; },
@@ -352,7 +356,7 @@ chrome.runtime.onMessage.addListener(
         isScraping = false;
         isPaused = false;
         clearAzubiSession();
-        chrome.storage.local.set({ scrapedData: [] }, () => sendResponse({ status: "reset" }));
+        StorageHelper.set("scrapedData", []).then(() => sendResponse({ status: "reset" }));
       },
       onStop: () => {
         isScraping = false;
@@ -376,11 +380,9 @@ chrome.runtime.onMessage.addListener(
   isScraping = true;
   isPaused = false;
 
-  const currentData = await new Promise(r =>
-    chrome.storage.local.get(['scrapedData'], res => r(res.scrapedData || []))
-  );
+  const currentData = await StorageHelper.get('scrapedData', []);
 
-  chrome.runtime.sendMessage({
+  safeSendMessage({
     action: 'progress',
     count: currentData.length,
     portalCount: currentData.filter(d => d.source === PORTAL_SOURCE).length,
@@ -388,7 +390,7 @@ chrome.runtime.onMessage.addListener(
   });
 
   try {
-    await handleSearchPage(session.limit);
+    await handleSearchPage(session.limit, session);
   } catch (err) {
     console.error('[Azubi] Resume error:', err);
     isScraping = false;

@@ -13,7 +13,9 @@
     "*://*.google.de/maps/*",
     "*://maps.google.com/*",
     "*://maps.google.de/*",
-    "*://www.dasoertliche.de/*"
+    "*://www.dasoertliche.de/*",
+    "http://*/*",
+    "https://*/*"
   ],
   "action": {
     "default_popup": "popup.html",

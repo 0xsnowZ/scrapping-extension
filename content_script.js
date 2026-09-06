@@ -24,7 +24,7 @@ let settings = {
 };
 
 // Initialize State from Storage
-chrome.storage.local.get(['scrapedData', 'isScraping', 'isPaused', 'targetLimit', 'filtersApplied', 'currentCardIndex', 'waitingForCaptcha', 'notifyCaptcha', 'notifyFinish', 'autoExport'], (result) => {
+StorageHelper.get(['scrapedData', 'isScraping', 'isPaused', 'targetLimit', 'filtersApplied', 'currentCardIndex', 'waitingForCaptcha', 'notifyCaptcha', 'notifyFinish', 'autoExport']).then((result) => {
     if (result.scrapedData) scrapedData = result.scrapedData;
     if (result.isScraping !== undefined) isScraping = result.isScraping;
     if (result.isPaused !== undefined) isPaused = result.isPaused;
@@ -45,8 +45,8 @@ chrome.storage.local.get(['scrapedData', 'isScraping', 'isPaused', 'targetLimit'
         if (result.waitingForCaptcha) {
             console.log('[Recovery] Was waiting for captcha — auto-pausing to avoid loop.');
             isPaused = true;
-            chrome.storage.local.set({ waitingForCaptcha: false, isPaused: true });
-            chrome.runtime.sendMessage({
+            StorageHelper.setMultiple({ waitingForCaptcha: false, isPaused: true });
+            safeSendMessage({
                 action: 'progress',
                 status: 'paused',
                 count: scrapedData.length,
@@ -61,7 +61,7 @@ chrome.storage.local.get(['scrapedData', 'isScraping', 'isPaused', 'targetLimit'
 
 // Update Storage helper
 function updateStorage() {
-    chrome.storage.local.set({
+    StorageHelper.setMultiple({
         scrapedData,
         isScraping,
         isPaused,
@@ -81,7 +81,7 @@ chrome.runtime.onMessage.addListener(
         {
             onSettings: (s) => {
                 settings = s;
-                chrome.storage.local.set(s);
+                StorageHelper.setMultiple(s);
             },
             onUpdateLimit: (limit) => { targetLimit = limit; },
             onPause: () => {
@@ -96,7 +96,7 @@ chrome.runtime.onMessage.addListener(
             onStop: () => {
                 isScraping = false;
                 isPaused = false;
-                chrome.storage.local.set({ waitingForCaptcha: false });
+                StorageHelper.set('waitingForCaptcha', false);
                 updateStorage();
             },
             start: (request, sendResponse) => {
@@ -108,7 +108,7 @@ chrome.runtime.onMessage.addListener(
                     currentCardIndex = 0;
                 }
                 targetLimit = request.limit || 50;
-                chrome.storage.local.set({ waitingForCaptcha: false });
+                StorageHelper.set('waitingForCaptcha', false);
                 updateStorage();
                 startScraping();
                 sendResponse({ status: 'started' });
@@ -119,7 +119,7 @@ chrome.runtime.onMessage.addListener(
                 scrapedData = [];
                 filtersApplied = false;
                 currentCardIndex = 0;
-                chrome.storage.local.set({ waitingForCaptcha: false });
+                StorageHelper.set('waitingForCaptcha', false);
                 updateStorage();
                 sendResponse({ status: 'reset' });
             },
@@ -166,7 +166,7 @@ async function startScraping() {
         isScraping = false;
         isPaused = false;
         updateStorage();
-        chrome.runtime.sendMessage({ action: 'error', message: String(err) });
+        safeSendMessage({ action: 'error', message: String(err) });
     }
 }
 
@@ -241,8 +241,7 @@ async function _startScraping() {
                 const info = extractInfo();
                 if (info) {
                     // Email dedup: skip if this email was already scraped
-                    const isDuplicate = scrapedData.some(d => d.email.toLowerCase() === info.email.toLowerCase());
-                    if (isDuplicate) {
+                    if (isDuplicateEmail(scrapedData, info.email)) {
                         console.log(`Card ${i}: Duplicate email ${info.email}, skipping.`);
                     } else {
                         // Try to find website link in the detail panel
@@ -254,7 +253,7 @@ async function _startScraping() {
                         scrapedData.push(info);
                         portalCount++;
                         console.log(`Extracted (${portalCount}/${targetLimit}):`, info);
-                        chrome.runtime.sendMessage({ action: 'progress', count: scrapedData.length, portalCount, currentTitle: info.company });
+                        safeSendMessage({ action: 'progress', count: scrapedData.length, portalCount, currentTitle: info.company });
                     }
                 } else {
                     console.log(`Card ${i}: No email found, skipping.`);
@@ -305,12 +304,12 @@ async function _startScraping() {
 
     // Only set finished if we actually hit the limit or ran out of results
     if (isScraping && !isPaused && (portalCount >= targetLimit || !document.getElementById('ergebnisliste-ladeweitere-button'))) {
-        if (settings.notifyFinish) finishedSound.play().catch(() => {});
+        if (settings.notifyFinish) playAudioSafely(finishedSound);
         isScraping = false;
         isPaused = false;
         updateStorage();
         const autoExported = triggerAutoExport(scrapedData, settings);
-        chrome.runtime.sendMessage({ action: 'finished', count: scrapedData.length, portalCount, totalChecked: currentCardIndex, autoExported });
+        safeSendMessage({ action: 'finished', count: scrapedData.length, portalCount, totalChecked: currentCardIndex, autoExported });
     }
 }
 
@@ -350,18 +349,18 @@ async function handleCaptcha() {
         // Save state immediately so if page refreshes during captcha,
         // recovery knows to auto-pause instead of restarting the loop
         updateStorage();
-        chrome.storage.local.set({ waitingForCaptcha: true });
+        StorageHelper.set('waitingForCaptcha', true);
 
-        chrome.runtime.sendMessage({ action: 'progress', status: 'waiting_captcha' });
+        safeSendMessage({ action: 'progress', status: 'waiting_captcha' });
 
         // Setup repeating sound every 4 seconds
         let soundInterval = null;
         if (settings.notifyCaptcha) {
-            captchaSound.play().catch(() => {});
+            playAudioSafely(captchaSound);
             soundInterval = setInterval(() => {
                 const stillExists = document.getElementById('captchaForm') || document.querySelector('form[id*="captcha"]') || document.getElementById('kontaktdaten-captcha-input') || document.querySelector('[id*="kontaktdaten-captcha"]');
                 if (stillExists && isScraping) {
-                    captchaSound.play().catch(() => {});
+                    playAudioSafely(captchaSound);
                 } else {
                     clearInterval(soundInterval);
                 }
@@ -489,7 +488,7 @@ async function handleCaptcha() {
         }
 
         // Captcha solved — clear the flag
-        chrome.storage.local.set({ waitingForCaptcha: false });
+        StorageHelper.set('waitingForCaptcha', false);
 
         if (soundInterval) clearInterval(soundInterval);
         if (notice) notice.remove();

@@ -90,7 +90,7 @@ function _rowToArray(row) {
     addr.plz,
     addr.city,
     contact,
-    row.link || "",
+    row.website || row.link || "",
     _cleanPhone(row.phone),
     row.source || "",
     row.extractedAt || "",

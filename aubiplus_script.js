@@ -6,10 +6,11 @@ let targetLimit = 50;
 const PORTAL_SOURCE = 'Aubi-Plus.de';
 
 const finishedSound = new Audio(chrome.runtime.getURL('finished.mp3'));
-let settings = { notifyFinish: true, autoExport: false };
-chrome.storage.local.get(["notifyFinish", "autoExport"], (res) => {
+let settings = { notifyFinish: true, autoExport: false, deepEmailLookup: true };
+StorageHelper.get(["notifyFinish", "autoExport", "deepEmailLookup"]).then((res) => {
     if (res.notifyFinish !== undefined) settings.notifyFinish = res.notifyFinish !== false;
     if (res.autoExport !== undefined) settings.autoExport = res.autoExport === true;
+    settings.deepEmailLookup = true;
 });
 
 // waitForElement() provided by utils.js (MutationObserver-based, loaded first via manifest.json)
@@ -43,15 +44,15 @@ async function handleSearchPage(limit = 50) {
     // Give it a moment to ensure cards are loaded
     await sleep(1000);
 
-    let currentData = await new Promise(r => {
-        chrome.storage.local.get(['scrapedData'], res => r(res.scrapedData || []));
-    });
+    let currentData = await StorageHelper.get('scrapedData', []);
 
     // Build URL dedup set from existing data to avoid duplicates on re-runs
     const seenUrls = new Set(currentData.map(d => d.link).filter(Boolean));
 
     let keepGoing = true;
     let currentPage = 1;
+    let emptyPageCount = 0;
+    const MAX_EMPTY_PAGES = 10;
 
     let docToSearch = document;
 
@@ -65,31 +66,26 @@ async function handleSearchPage(limit = 50) {
         if (!isScraping) break;
 
         if (currentPage > 1) {
-            // Recognize Aubi-Plus pagination button
-            let nextBtn = docToSearch.querySelector('li.page-item a[rel="next"]') ||
-                docToSearch.querySelector('a.page-link[aria-label*="Next"]') ||
-                docToSearch.querySelector('a.page-link[aria-label*="Weiter"]') ||
-                Array.from(docToSearch.querySelectorAll('ul.pagination a.page-link')).find(a => (a.textContent || '').includes('»') || (a.textContent || '').includes('Weiter') || (a.textContent || '').includes('Nächste'));
+            // Recognize Aubi-Plus pagination button (exclude disabled buttons e.g. on final page)
+            let nextBtn = docToSearch.querySelector('li.page-item:not(.disabled) a[rel="next"]') ||
+                docToSearch.querySelector('li.page-item:not(.disabled) a.page-link[aria-label*="Next"]') ||
+                docToSearch.querySelector('li.page-item:not(.disabled) a.page-link[aria-label*="Weiter"]') ||
+                Array.from(docToSearch.querySelectorAll('ul.pagination li.page-item:not(.disabled) a.page-link')).find(a => (a.textContent || '').includes('»') || (a.textContent || '').includes('Weiter') || (a.textContent || '').includes('Nächste'));
 
-            if (!nextBtn || !nextBtn.href) {
-                console.log("No next page button found. Pagination ends.");
+            const rawHref = nextBtn ? (nextBtn.getAttribute('href') || '').trim() : '';
+            if (!nextBtn || !rawHref || rawHref === '#' || rawHref.startsWith('javascript:')) {
+                console.log("[AubiPlus] No next page button found or reached last page. Pagination ends.");
                 break; // No more cards/pages found
             }
 
             try {
-                // Because DOMParser resolves relative URLs differently, we might need absolute URL
-                let nextUrl = nextBtn.href;
-                if (nextUrl.startsWith('chrome-extension')) {
-                    nextUrl = new URL(nextBtn.getAttribute('href'), 'https://www.aubi-plus.de').href;
-                }
-
-                console.log("Fetching next page: ", nextUrl);
+                let nextUrl = resolveHref(rawHref, 'https://www.aubi-plus.de');
+                console.log("[AubiPlus] Fetching next page: ", nextUrl);
                 const res = await fetchWithRetry(nextUrl);
                 const text = await res.text();
-                const parser = new DOMParser();
-                docToSearch = parser.parseFromString(text, 'text/html');
+                docToSearch = parseHtml(text);
             } catch (e) {
-                console.error("Error fetching next page", e);
+                console.error("[AubiPlus] Error fetching next page", e);
                 break;
             }
         }
@@ -114,9 +110,21 @@ async function handleSearchPage(limit = 50) {
             href = resolveHref(linkElement.getAttribute('href') || href, 'https://www.aubi-plus.de');
 
             if (!seenUrls.has(href)) {
+                seenUrls.add(href);
                 cardUrls.push(href);
             }
         }
+
+        if (cardUrls.length === 0) {
+            emptyPageCount++;
+            if (emptyPageCount >= MAX_EMPTY_PAGES) {
+                console.log(`[AubiPlus] No new cards after ${MAX_EMPTY_PAGES} pages. Ending.`);
+                break;
+            }
+            currentPage++;
+            continue;
+        }
+        emptyPageCount = 0;
 
         // Process in parallel batches of 5 for ~5x speed improvement
         const BATCH_SIZE = 5;
@@ -133,8 +141,7 @@ async function handleSearchPage(limit = 50) {
                 try {
                     const response = await fetchWithRetry(href);
                     const text = await response.text();
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(text, 'text/html');
+                    const doc = parseHtml(text);
 
                     // Aubi-Plus encodes script type as "application&#x2F;ld&#x2B;json"
                     // which breaks querySelector, so extract hiringOrganization.name via regex
@@ -170,7 +177,8 @@ async function handleSearchPage(limit = 50) {
                             return '';
                         })();
 
-                    const email = extractEmailFromHtml(text);
+                    let email = extractEmailFromHtml(text);
+                    const website = await resolveCompanyWebsite(doc, 'aubi-plus.de');
                     const phone = (() => {
                             const el = doc.querySelector('.phoneNumber');
                             return el ? el.textContent.trim() : '';
@@ -186,7 +194,7 @@ async function handleSearchPage(limit = 50) {
                         return '';
                     })();
 
-                    return { href, companyName, address, email, phone, contact };
+                    return { href, companyName, address, email, phone, contact, website };
                 } catch (err) {
                     console.error("Error fetching details", err);
                     return null;
@@ -198,16 +206,29 @@ async function handleSearchPage(limit = 50) {
                 if (result.status !== 'fulfilled' || !result.value) continue;
                 if (currentData.filter(d => d.source === PORTAL_SOURCE).length >= targetLimit) break;
 
-                const { href, companyName, address, email, phone, contact } = result.value;
+                const { href, companyName, address, phone, contact, website } = result.value;
+                let email = result.value.email;
+
+                // Deep Email Lookup fallback if no direct email is in the job card
+                if (!email && settings.deepEmailLookup && website) {
+                    console.log(`[AubiPlus] No direct email for ${href}, attempting Deep Email Lookup on: ${website}`);
+                    try {
+                        email = await crawlWebsiteForEmailWithTimeout(website, 5000);
+                        if (email) {
+                            console.log(`[AubiPlus] ✓ Deep Lookup found email: ${email} (${website})`);
+                        }
+                    } catch (e) {
+                        console.warn(`[AubiPlus] Deep Lookup error for ${website}:`, e);
+                    }
+                }
 
                 if (!email) {
-                    chrome.runtime.sendMessage({ action: 'progress', count: currentData.length, portalCount: currentData.filter(d => d.source === PORTAL_SOURCE).length, currentTitle: `Checking: ${companyName || 'Unknown'} (no email)` });
+                    safeSendMessage({ action: 'progress', count: currentData.length, portalCount: currentData.filter(d => d.source === PORTAL_SOURCE).length, currentTitle: `Checking: ${companyName || 'Unknown'} (no email)` });
                     continue;
                 }
 
                 // Email dedup: skip if this email was already scraped
-                const isDuplicate = currentData.some(d => d.email.toLowerCase() === email.toLowerCase());
-                if (isDuplicate) {
+                if (isDuplicateEmail(currentData, email)) {
                     console.log("[AubiPlus] Duplicate email, skipping:", email);
                     continue;
                 }
@@ -219,16 +240,17 @@ async function handleSearchPage(limit = 50) {
                     address: address,
                     contact: contact || '',
                     link: href,
+                    website: website || '',
                     phone: phone,
                     source: PORTAL_SOURCE,
                     extractedAt: new Date().toISOString()
                 });
 
-                chrome.runtime.sendMessage({ action: 'progress', count: currentData.length, portalCount: currentData.filter(d => d.source === PORTAL_SOURCE).length, currentTitle: companyName });
+                safeSendMessage({ action: 'progress', count: currentData.length, portalCount: currentData.filter(d => d.source === PORTAL_SOURCE).length, currentTitle: companyName });
             }
 
             // Save once per batch instead of per-item
-            await new Promise(r => chrome.storage.local.set({ scrapedData: currentData }, r));
+            await StorageHelper.set('scrapedData', currentData);
 
             // Anti-bot delay between batches
             await sleep(200);
@@ -238,14 +260,14 @@ async function handleSearchPage(limit = 50) {
     }
 
     if (isScraping) {
-        if (settings.notifyFinish) finishedSound.play().catch(() => {});
+        if (settings.notifyFinish) playAudioSafely(finishedSound);
         const portalCount = currentData.filter(d => d.source === PORTAL_SOURCE).length;
         const autoExported = triggerAutoExport(currentData, settings);
-        chrome.runtime.sendMessage({ action: 'finished', count: currentData.length, portalCount, totalChecked: seenUrls.size || portalCount, autoExported });
+        safeSendMessage({ action: 'finished', count: currentData.length, portalCount, totalChecked: seenUrls.size || portalCount, autoExported });
     }
     isScraping = false;
     isPaused = false;
-    chrome.storage.local.set({ isScraping: false, isPaused: false });
+    StorageHelper.setMultiple({ isScraping: false, isPaused: false });
 }
 
 // Wrap with error propagation
@@ -257,8 +279,8 @@ handleSearchPage = async function(limit) {
         console.error('[AubiPlus] Scraping error:', err);
         isScraping = false;
         isPaused = false;
-        chrome.storage.local.set({ isScraping: false, isPaused: false });
-        chrome.runtime.sendMessage({ action: 'error', message: String(err) });
+        StorageHelper.setMultiple({ isScraping: false, isPaused: false });
+        safeSendMessage({ action: 'error', message: String(err) });
     }
 };
 
@@ -284,7 +306,7 @@ chrome.runtime.onMessage.addListener(
     createScraperMessageHandler(
         () => ({ isScraping, isPaused }),
         {
-            onSettings: (s) => { settings = s; },
+            onSettings: (s) => { settings = { ...s, deepEmailLookup: true }; },
             onUpdateLimit: (limit) => { targetLimit = limit; },
             onPause: () => { isPaused = true; },
             onResume: () => { isPaused = false; },
@@ -297,7 +319,7 @@ chrome.runtime.onMessage.addListener(
             reset: (request, sendResponse) => {
                 isScraping = false;
                 isPaused = false;
-                chrome.storage.local.set({ scrapedData: [] }, () => sendResponse({ status: 'reset' }));
+                StorageHelper.set('scrapedData', []).then(() => sendResponse({ status: 'reset' }));
             },
             countResults: (request, sendResponse) => {
                 countResults().then(total => sendResponse({ total }));
